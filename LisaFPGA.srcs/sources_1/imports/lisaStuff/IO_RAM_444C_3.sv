@@ -1,0 +1,52 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: N/A
+// Engineer: AlexTheCat123
+// 
+// Create Date: 09/23/2025 05:41:58 PM
+// Design Name: Apple Lisa Floppy Controller RAM (444C-3)
+// Module Name: IO_RAM_444C_3
+// Project Name: LisaFPGA
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module IO_RAM_444C_3(
+    input logic [9:0] A,
+    input logic _CS,
+    input logic R_W,
+    input logic [3:0] D_in,
+    output wire [3:0] D_out
+    );
+
+    // The RAM array itself; 1024 x 4 Bits
+    `ifdef SIMULATION
+        logic [3:0] RAM_array [0:1023] = '{default:4'b0000};
+    `else
+        logic [3:0] RAM_array [0:1023];
+    `endif
+
+    (* MARK_DEBUG = "TRUE" *) logic [3:0] D_out_int;
+    assign D_out = (!_CS) ? D_out_int : 4'bz;
+
+    always_ff @(negedge _CS) begin
+        // If the chip is selected and it's a read, then forward the data on to the output
+        if (R_W) begin
+            D_out_int <= RAM_array[A];
+        // If the chip is selected and it's a write, then grab the 4 bits off the bus and write them to RAM
+        end else begin
+            RAM_array[A] <= D_in;
+            D_out_int <= 4'bz; // Just to get everything off the bus and be safe
+        end
+    end
+
+endmodule
