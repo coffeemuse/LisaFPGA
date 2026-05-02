@@ -1,17 +1,9 @@
 ## The XDC file for the LisaFPGA Desktop board. There are a whole lot of pins defined in here!
-## As well as some allowing of combinatorial loops, which we have to do thanks to the Lisa's architecture.
 
+## As well as some other stuff, like this allowing of combinatorial loops on certain nets
+## Which we have to do thanks to the Lisa's architecture
 set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets {cpu_board/BD_out[*]}]
 set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/_BUST_latched]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/_BUST_latched_inferred_i_1]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/_BUST_latched__0]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/BD_inferred_i_21_n_0]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/BD_inferred_i_22_n_0]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/BD_inferred_i_23_n_0]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/BD_inferred_i_24_n_0]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/BD_inferred_i_25_n_0]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/BD_inferred_i_26_n_0]
-set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets cpu_board/BD_inferred_i_27_n_0]
 set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets {cpu_board/latched_MMU_address[13]}]
 set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets {cpu_board/latched_MMU_address[14]}]
 set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets {cpu_board/latched_MMU_address[15]}]
@@ -41,10 +33,6 @@ set_false_path -to [get_cells usbrst_sync_reg]
 set_false_path -to [get_cells io_board/_AS_sync_reg]
 ## False-path into the INTIO synchronizer on the I/O board; ignore it because the synchronizer once again handles the DOTCK-to-C16M CDC
 set_false_path -to [get_cells io_board/_INTIO_sync_reg]
-## Another false path for A and BD_in on the I/O board
-## They're not synchronized but we don't care because AS is, and AS is what controls when the data gets latched
-set_false_path -from [get_ports {io_board/A[*]}] -to [get_cells {io_board/A_latched_reg[*]}]
-set_false_path -from [get_ports {io_board/BD_in[*]}] -to [get_cells {io_board/RD_in_reg[*]}]
 
 ## Here's another false path for the system ON signal
 ## This goes into the DOTCK BUFGCTRL and serves as the clock enable
@@ -136,11 +124,13 @@ set_false_path -to [get_cells lisa_lite/MT_int_reg]
 
 ## Create a constraint for our 48KHz audio clock
 ## This is important because we generate it in the logic world, and then move it to a clock net with a BUFG
-create_generated_clock -name clk_audio -source [get_pins lisa_hdmi_output/hdmi_clock_generator/CLKOUT3] -period 20833.333 [get_pins lisa_hdmi_output/buf_audio/O]
+## The divide_by is saying that we divide the source clock (which is the 74.25MHz 1080p30 clock) by 1547 to get our 48KHz generated clock
+create_generated_clock -name clk_audio -source [get_pins lisa_hdmi_output/hdmi_clock_generator/clk_pixel_1080p30] -divide_by 1547 [get_pins lisa_hdmi_output/buf_audio/O]
 
-## The 125MHz sysclk signal
-## ADD CREATE_CLOCKS FOR ALL THE OTHER CLOCK SIGNALS TOO!!!!
+## And a create_clock constraint for our main 125MHz sysclk signal
 create_clock -period 8.000 -name sys_clk_pin -waveform {0.000 4.000} -add [get_ports sysclk]
+
+## Now define all of our I/O pin constraints, starting with the sysclk input
 set_property -dict {PACKAGE_PIN B8 IOSTANDARD LVCMOS33} [get_ports sysclk]
 
 ## Audio and Video Stuff
@@ -208,10 +198,7 @@ set_property -dict {PACKAGE_PIN N4 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[7]}]
 set_property -dict {PACKAGE_PIN R1 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[8]}]
 set_property -dict {PACKAGE_PIN T1 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[9]}]
 set_property -dict {PACKAGE_PIN M6 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[10]}]
-# Normal SRAM Pin
 set_property -dict {PACKAGE_PIN N6 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[11]}]
-# GPIO SRAM Pin
-#set_property -dict {PACKAGE_PIN E2 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[11]}]
 set_property -dict {PACKAGE_PIN R6 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[12]}]
 set_property -dict {PACKAGE_PIN R5 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[13]}]
 set_property -dict {PACKAGE_PIN V7 IOSTANDARD LVCMOS33} [get_ports {D_SRAM[14]}]
