@@ -100,7 +100,7 @@ if ! python3 -c "import usb.core" &>/dev/null; then
             fi
             ;;
         macos)
-            pip3 install --quiet pyusb
+            pip3 install --quiet --break-system-packages pyusb
             ;;
     esac
 fi
@@ -320,21 +320,32 @@ try:
 except Exception:
     sys.exit(1)
 
+def hub_port_from_location(hub_loc_str, child_loc_str):
+    """Derive the physical hub port from location IDs.
+    macOS encodes each port level as a nibble: hub at 0x01100000 has
+    children at 0x0111xxxx (port 1), 0x0112xxxx (port 2), etc.
+    system_profiler does NOT list _items in port order, so we must
+    compute the port from the location_id rather than using the array index."""
+    try:
+        hub_loc   = int(hub_loc_str.split()[0], 16)
+        child_loc = int(child_loc_str.split()[0], 16)
+        trailing  = (hub_loc & -hub_loc).bit_length() - 1  # trailing zero bits
+        return (child_loc >> (trailing - 4)) & 0xF
+    except Exception:
+        return -1
+
 def scan(items):
     for item in items:
         vid = item.get('vendor_id', '').upper().replace('0X', '0x')
         pid = item.get('product_id', '').upper().replace('0X', '0x')
-        if hub_vid_str.upper() in vid and hub_pid_str.upper() in pid:
-            children = item.get('_items', [])
-            # system_profiler lists hub children in port order
-            # port numbers are 1-based; index = port-1
-            idx = target_port - 1
-            if idx < len(children):
-                child = children[idx]
-                # serial number of this ESP32
+        if hub_vid_str in vid and hub_pid_str in pid:
+            hub_loc_str = item.get('location_id', '')
+            for child in item.get('_items', []):
+                child_loc_str = child.get('location_id', '')
+                if hub_port_from_location(hub_loc_str, child_loc_str) != target_port:
+                    continue
                 child_serial = child.get('serial_num', '')
                 if child_serial:
-                    # Now find the /dev/cu.* via ioreg
                     try:
                         out = subprocess.check_output(
                             ['ioreg', '-r', '-c', 'IOUSBHostDevice', '-l'],
@@ -672,18 +683,19 @@ sleep 3
 step "Get ESFloppy Firmware"
 
 ESFLOPPY_DIR="$SCRIPT_DIR/ESFloppy"
-if [[ -d "$ESFLOPPY_DIR/.git" ]]; then
-    info "ESFloppy repo already exists locally, pulling latest..."
-    git -C "$ESFLOPPY_DIR" pull
-else
-    info "Cloning ESFloppy repo..."
-    git clone https://github.com/alexthecat123/ESFloppy.git "$ESFLOPPY_DIR"
-fi
+# Comment these lines back in once ESFloppy is working!
+#if [[ -d "$ESFLOPPY_DIR/.git" ]]; then
+#    info "ESFloppy repo already exists locally, pulling latest..."
+#    git -C "$ESFLOPPY_DIR" pull
+#else
+#    info "Cloning ESFloppy repo..."
+#    git clone https://github.com/alexthecat123/ESFloppy.git "$ESFLOPPY_DIR"
+#fi
 
 ESFLOPPY_INO_DIR="$ESFLOPPY_DIR/ESFloppy"
 ESFLOPPY_INO="$ESFLOPPY_INO_DIR/ESFloppy.ino"
 
-# ESFloppy uses the same LisaFPGA/standalone pattern if applicable
+# ESFloppy uses the same LisaFPGA/standalone pattern
 if [[ -f "$ESFLOPPY_INO" ]]; then
     if grep -q "PinDefs_ESFloppy\|PinDefs_LisaFPGA\|PinDefs_Standalone" "$ESFLOPPY_INO" 2>/dev/null; then
         info "Patching ESFloppy.ino for LisaFPGA pin defs..."
