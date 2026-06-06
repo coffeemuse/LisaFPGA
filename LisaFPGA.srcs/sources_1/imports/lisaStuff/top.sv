@@ -114,7 +114,7 @@ module top(
 
         input logic MOUSE_SEL,
 
-        input logic [5:0] GPIO,
+        (* PULLTYPE = "PULLDOWN" *) input logic [5:0] GPIO,
 
         output logic SCC_C4M,
         output logic SCC_WR,
@@ -1234,7 +1234,8 @@ module top(
         ._SCC_PSI(_SCC_PSI),
         .SCC_DOUT(SCC_DOUT),
         .SCC_DIN(SCC_DIN),
-        .IO_ROM_SEL(IO_ROM_SEL)
+        .IO_ROM_SEL(IO_ROM_SEL),
+        .spoof_88(GPIO[1])
     );
 
 

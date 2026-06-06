@@ -123,7 +123,8 @@ module IO_board(
     output logic [7:0] SCC_DOUT,
     input logic [7:0] SCC_DIN,
     
-    input logic IO_ROM_SEL // Selects whether the I/O board uses ROM revision A8 or 40
+    input logic IO_ROM_SEL, // Selects whether the I/O board uses ROM revision A8 or 40
+    input logic spoof_88 // If set, this makes the FDC RAM at address 0x018 (FCC030) return 0x88 instead of its actual contents
     );
 
     // Before we do anything else, let's take the _SYSTEM_RESET signal and turn it into a _RESET signal for the I/O board
@@ -358,6 +359,7 @@ module IO_board(
 
     IO_RAM_444C_3 low_FDC_RAM(
         .A(RA),
+        .spoof_88(spoof_88), // Make the RAM always return ROM revision 88 if spoof_88 is set
         ._CS(_FDC_RAM_CS_processed),
         .R_W(RW_FDC_RAM),
         .D_in(RD_in[3:0]), // We'll talk about this in a second
@@ -366,6 +368,7 @@ module IO_board(
 
     IO_RAM_444C_3 high_FDC_RAM(
         .A(RA),
+        .spoof_88(spoof_88),
         ._CS(_FDC_RAM_CS_processed),
         .R_W(RW_FDC_RAM),
         .D_in(RD_in[7:4]), // Same here

@@ -22,6 +22,7 @@
 
 module IO_RAM_444C_3(
     input logic [9:0] A,
+    input logic spoof_88,
     input logic _CS,
     input logic R_W,
     input logic [3:0] D_in,
@@ -41,7 +42,14 @@ module IO_RAM_444C_3(
     always_ff @(negedge _CS) begin
         // If the chip is selected and it's a read, then forward the data on to the output
         if (R_W) begin
-            D_out_int <= RAM_array[A];
+            // If we're trying to access address 0x018 (FCC030), and spoof88 is set, then return 0x8 instead of the actual contents
+            // This way, we can trick the Lisa into thinking this is a 2/10 by returning ROM revision 88 instead of A8 if the user wants
+            if (A == 10'h018 && spoof_88) begin
+                D_out_int <= 4'h8;
+            end else begin
+                // Otherwise, just return the actual contents of the RAM at the specified address
+                D_out_int <= RAM_array[A];
+            end
         // If the chip is selected and it's a write, then grab the 4 bits off the bus and write them to RAM
         end else begin
             RAM_array[A] <= D_in;
