@@ -1,20 +1,10 @@
 <?xml version="1.0"?>
 <ProcessHandle Version="1" Minor="0">
-    <Process Command="vivado" Owner="alexthecat123" Host="alex-cattop" Pid="1113421" HostCore="16" HostMemory="32019480">
+    <Process Command="vivado" Owner="alexthecat123" Host="alex-cattop" Pid="2059532" HostCore="16" HostMemory="32019480">
     </Process>
 </ProcessHandle>
 <?xml version="1.0"?>
 <ProcessHandle Version="1" Minor="0">
-    <Process Command="vivado" Owner="alexthecat123" Host="alex-cattop" Pid="1168163" HostCore="16" HostMemory="32019480">
-    </Process>
-</ProcessHandle>
-<?xml version="1.0"?>
-<ProcessHandle Version="1" Minor="0">
-    <Process Command="vivado" Owner="alexthecat123" Host="alex-cattop" Pid="1642738" HostCore="16" HostMemory="32019480">
-    </Process>
-</ProcessHandle>
-<?xml version="1.0"?>
-<ProcessHandle Version="1" Minor="0">
-    <Process Command="vivado" Owner="alexthecat123" Host="alex-cattop" Pid="1703087" HostCore="16" HostMemory="32019480">
+    <Process Command="vivado" Owner="alexthecat123" Host="alex-cattop" Pid="2114848" HostCore="16" HostMemory="32019480">
     </Process>
 </ProcessHandle>

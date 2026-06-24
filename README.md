@@ -272,6 +272,8 @@ Connecting the 20-pin cable is easy; just plug one end into the SONY FLOPPY DRIV
 
 The 6-pin cable is a bit less elegant because I'm an idiot. For the sake of saving space, I made the auxiliary Twiggy connector a 4-pin connector (2x2), but clearly I wasn't thinking straight because this allows you to easily plug it in backwards. Plus, they don't even make 4-pin ribbon cable connectors!!! So the solution is to use a 6-pin connector and install it with 2 of the holes sticking up above the connector and the other 4 actually plugged in. Plug one end of this cable into the TWIG connector on the main LisaFPGA board and the other end into the AUX IN connector on the Twiggy breakout. For the sake of ensuring that the cable orientation is correct, make sure to plug in the connector with the red stripe facing down towards the board on both ends.
 
+To make matters worse, I didn't account for the width of the connector given that I originally planned on only using a 4-pin cable, so you'll need to bend the 4-pin header on both PCBs upward to get the cable to seat properly. If you bought a board from JCM or MacEffects, I will have already done this for you. Sorry that I'm such an idiot!!!
+
 The 26-pin cables are a lot easier; stick one end of the first cable into the UPPER TWIGGY connector on the breakout board, and the other end into the connector on the back of your upper Twiggy drive. Then repeat for the LOWER TWIGGY connector and your lower Twiggy drive.
 
 Make sure you have the I/O ROM SELECT switch on the LisaFPGA board set to the 40 position if you plan on using Twiggy drives.

@@ -49,7 +49,22 @@ module z8530_scc #(
     // software wrote, and other TC values pass through unchanged. Channel A
     // is left alone because its source is 4 MHz where Uniplus's TC table is
     // already correct.
-    parameter UNIPLUS_BAUD_PATCH_B = 1
+    parameter UNIPLUS_BAUD_PATCH_B = 1,
+    // Enable WR3[5] Auto Enables: /CTS gates the transmitter, /DCD gates the
+    // receiver, and (async) /RTS deassert is deferred until the transmitter
+    // is empty. Set to 0 to compile the feature out (RTS strictly follows
+    // WR5[1]; CTS/DCD remain status/interrupt-only).
+    parameter AUTO_ENABLES_EN = 1,
+    // Per-channel "RTxC from XTAL, full-rate clock" support (synthesis-time):
+    //   When set to 1 and software programs WR11[7]=1 (RTxC=XTAL) with both the
+    //   RX clock source (WR11[6:5]=00) and TX clock source (WR11[4:3]=00) set to
+    //   RTxC, the channel's serial engine is clocked every sclk cycle (RTxC is
+    //   treated as the sclk crystal) instead of from a routed pin clock. The
+    //   WR4 clock-mode divide (x1/16/32/64) still applies, so the effective bit
+    //   rate is sclk/ClockMode. Set to 0 to compile the override out (that WR11
+    //   encoding then selects the RTxC pin, which is tied off -> dead engine).
+    parameter RTXC_XTAL_FULLRATE_A = 1,
+    parameter RTXC_XTAL_FULLRATE_B = 1
 ) (
     // System Interface
     input  wire        clk,           // CPU/bus clock (register file, interrupts, RR mux)
@@ -78,7 +93,7 @@ module z8530_scc #(
     output wire        txda,          // Transmit data A
     input  wire        ctsa_n,        // Clear to send A (active low)
     input  wire        dcda_n,        // Data carrier detect A (active low)
-    input  wire        synca_n,       // /SYNC A input (Lisa: wired to DSR); async mode: reflected in RR0[4]
+    input  wire        synca_n,       // Sync A (async-mode input -> RR0[4], active low)
     output wire        rtsa_n,        // Request to send A (active low)
     output wire        dtra_n,        // Data terminal ready A (active low)
 
@@ -89,7 +104,7 @@ module z8530_scc #(
     output wire        txdb,          // Transmit data B
     input  wire        ctsb_n,        // Clear to send B (active low)
     input  wire        dcdb_n,        // Data carrier detect B (active low)
-    input  wire        syncb_n,       // /SYNC B input (Lisa: used for XTAL, not a status pin -- kept for model symmetry); async mode: reflected in RR0[4]
+    input  wire        syncb_n,       // Sync B (async-mode input -> RR0[4], active low)
     output wire        rtsb_n,        // Request to send B (active low)
     output wire        dtrb_n         // Data terminal ready B (active low)
 );
@@ -102,6 +117,9 @@ module z8530_scc #(
 // Register pointer
 reg [3:0] reg_ptr_a;
 reg [3:0] reg_ptr_b;
+
+// Auto-Enable deferred /RTS deassert hold (clk domain)
+reg        rts_hold_a, rts_hold_b;
 
 // Write Registers for Channel A (WR0-WR15)
 reg [7:0] wr0_a, wr1_a, wr2_a, wr3_a, wr4_a, wr5_a, wr6_a, wr7_a;
@@ -140,7 +158,7 @@ reg        brg_out_a_d, brg_out_b_d;
 reg [3:0]  tx_state_a, tx_state_b;
 reg [7:0]  tx_shift_a, tx_shift_b;
 reg [3:0]  tx_bit_cnt_a, tx_bit_cnt_b;
-reg [3:0]  tx_sample_cnt_a, tx_sample_cnt_b;  // x16 timing counters
+reg [5:0]  tx_sample_cnt_a, tx_sample_cnt_b;  // clock-mode timing counters (x1/16/32/64)
 reg        tx_out_a, tx_out_b;
 reg        tx_active_a, tx_active_b;
 reg        tx_underrun_a, tx_underrun_b;       // placeholder, unused (kept for RR0)
@@ -150,7 +168,7 @@ reg        tx_byte_grab_toggle_a, tx_byte_grab_toggle_b; // TX int trigger pulse
 reg [3:0]  rx_state_a, rx_state_b;
 reg [7:0]  rx_shift_a, rx_shift_b;
 reg [3:0]  rx_bit_cnt_a, rx_bit_cnt_b;
-reg [3:0]  rx_sample_cnt_a, rx_sample_cnt_b;
+reg [5:0]  rx_sample_cnt_a, rx_sample_cnt_b;  // clock-mode timing counters (x1/16/32/64)
 reg        rx_active_a, rx_active_b;
 
 // RX BREAK detect (sclk domain). break_*_s is sticky-high while the RX line
@@ -193,6 +211,7 @@ reg [1:0]  break_a_sync, break_b_sync;   // BREAK status sclk -> clk
 reg [1:0]  rx_framing_err_a_sync, rx_framing_err_b_sync;
 reg [1:0]  rx_parity_err_a_sync, rx_parity_err_b_sync;
 reg [1:0]  tx_underrun_a_sync, tx_underrun_b_sync;
+reg [1:0]  tx_drained_a_sync, tx_drained_b_sync;   // sclk transmitter-idle -> clk
 
 // Clock synchronizers
 //   External serial-clock pins (rxca/rxcb/txca/txcb) live in the sclk domain;
@@ -209,11 +228,16 @@ wire       rxca_rise_s, rxcb_rise_s, txca_rise_s, txcb_rise_s;    // sclk side
 
 // Modem signal synchronizers (clk domain - used by ext/status int logic)
 reg [2:0]  ctsa_sync, ctsb_sync, dcda_sync, dcdb_sync;
-// /SYNC inputs. On the Lisa, /SYNCA is wired to DSR and /SYNCB is used by the
-// crystal-oscillator circuit (not a status pin) -- syncb_n is kept only for
-// model symmetry/generality. Async mode: live level reflected in RR0[4] only;
-// no interrupt is generated (datasheet: "no other function").
+
+// /SYNC pin synchronizers (clk domain). In async receive mode these pins are
+// inputs whose level is reflected in RR0[4] (Sync/Hunt); per the datasheet they
+// have no other function here (status only - no interrupt, no gating).
 reg [2:0]  synca_sync, syncb_sync;
+
+// CTS/DCD synchronized into the per-channel sclk domains for Auto-Enable
+// TX/RX gating (active-low pins; asserted = 0).
+reg [1:0]  ctsa_s_sync, dcda_s_sync;   // sclk_a
+reg [1:0]  ctsb_s_sync, dcdb_s_sync;   // sclk_b
 
 //============================================================================
 // Parameters and State Definitions
@@ -246,10 +270,11 @@ wire write_en   = chip_sel & ~wr_cmd_n_p/*wr_n*/;
 
 assign data_oe  = read_en;
 
-// RTS and DTR outputs
-assign rtsa_n = ~wr5_a[1];  // RTS bit in WR5
+// RTS and DTR outputs. With Auto Enables, RTS deassert is deferred (see the
+// rts_hold_* logic below); assert is always immediate.
+assign rtsa_n = ~(wr5_a[1] | rts_hold_a);  // RTS bit in WR5
 assign dtra_n = ~wr5_a[7];  // DTR bit in WR5
-assign rtsb_n = ~wr5_b[1];
+assign rtsb_n = ~(wr5_b[1] | rts_hold_b);
 assign dtrb_n = ~wr5_b[7];
 
 // TX data outputs. WR5[4] (Send Break) forces the line low regardless of FSM.
@@ -516,10 +541,57 @@ end
 // TX / RX bit-clock selection (sclk)
 //============================================================================
 
-wire tx_clk_a_s = (wr11_a_s[4:3] == 2'b10) ? brg_rise_a_s : txca_rise_s;
-wire tx_clk_b_s = (wr11_b_s[4:3] == 2'b10) ? brg_rise_b_s : txcb_rise_s;
-wire rx_clk_a_s = (wr11_a_s[6:5] == 2'b10) ? brg_rise_a_s : rxca_rise_s;
-wire rx_clk_b_s = (wr11_b_s[6:5] == 2'b10) ? brg_rise_b_s : rxcb_rise_s;
+// "RTxC from XTAL, both RX and TX clocks from RTxC" -> run the serial engine at
+// full sclk rate (RTxC == sclk) without routing an actual pin clock. Per-channel
+// compile-time enable. Uses the sclk-synced WR11 copy.
+wire rtxc_xtal_a_s = (RTXC_XTAL_FULLRATE_A != 0) && wr11_a_s[7]
+                     && (wr11_a_s[6:5] == 2'b00) && (wr11_a_s[4:3] == 2'b00);
+wire rtxc_xtal_b_s = (RTXC_XTAL_FULLRATE_B != 0) && wr11_b_s[7]
+                     && (wr11_b_s[6:5] == 2'b00) && (wr11_b_s[4:3] == 2'b00);
+
+wire tx_clk_a_s = rtxc_xtal_a_s ? 1'b1 : ((wr11_a_s[4:3] == 2'b10) ? brg_rise_a_s : txca_rise_s);
+wire tx_clk_b_s = rtxc_xtal_b_s ? 1'b1 : ((wr11_b_s[4:3] == 2'b10) ? brg_rise_b_s : txcb_rise_s);
+wire rx_clk_a_s = rtxc_xtal_a_s ? 1'b1 : ((wr11_a_s[6:5] == 2'b10) ? brg_rise_a_s : rxca_rise_s);
+wire rx_clk_b_s = rtxc_xtal_b_s ? 1'b1 : ((wr11_b_s[6:5] == 2'b10) ? brg_rise_b_s : rxcb_rise_s);
+
+//============================================================================
+// Auto Enables (WR3[5]) - CTS/DCD synchronized into sclk + gating terms
+//   /CTS (low) auto-enables the transmitter; /DCD (low) auto-enables the
+//   receiver. Synchronized into each channel's sclk domain so the TX/RX FSMs
+//   can gate on them. Reset to deasserted so a channel won't transmit until
+//   /CTS has actually been seen after reset (matches the real chip).
+//============================================================================
+
+always @(posedge sclk_a or negedge sreset_n_a) begin
+    if (!sreset_n_a) begin
+        ctsa_s_sync <= 2'b11;
+        dcda_s_sync <= 2'b11;
+    end else begin
+        ctsa_s_sync <= {ctsa_s_sync[0], ctsa_n};
+        dcda_s_sync <= {dcda_s_sync[0], dcda_n};
+    end
+end
+always @(posedge sclk_b or negedge sreset_n_b) begin
+    if (!sreset_n_b) begin
+        ctsb_s_sync <= 2'b11;
+        dcdb_s_sync <= 2'b11;
+    end else begin
+        ctsb_s_sync <= {ctsb_s_sync[0], ctsb_n};
+        dcdb_s_sync <= {dcdb_s_sync[0], dcdb_n};
+    end
+end
+
+// Auto Enables active in sclk (uses the already-synced WR3 copy)
+wire auto_en_a_s = (AUTO_ENABLES_EN != 0) && wr3_a_s[5];
+wire auto_en_b_s = (AUTO_ENABLES_EN != 0) && wr3_b_s[5];
+
+// TX may start a new char when Auto Enables is off, or /CTS is asserted (low)
+wire tx_cts_ok_a_s = ~auto_en_a_s | ~ctsa_s_sync[1];
+wire tx_cts_ok_b_s = ~auto_en_b_s | ~ctsb_s_sync[1];
+
+// RX may begin a frame when Auto Enables is off, or /DCD is asserted (low)
+wire rx_dcd_ok_a_s = ~auto_en_a_s | ~dcda_s_sync[1];
+wire rx_dcd_ok_b_s = ~auto_en_b_s | ~dcdb_s_sync[1];
 
 //============================================================================
 // Character-length helpers
@@ -545,6 +617,35 @@ function [3:0] get_rx_bits;
             2'b01: get_rx_bits = 4'd7;
             2'b10: get_rx_bits = 4'd6;
             2'b11: get_rx_bits = 4'd8;
+        endcase
+    end
+endfunction
+
+// WR4[7:6] clock mode -> (samples per bit) - 1.
+//   00 = x1 -> 0, 01 = x16 -> 15, 10 = x32 -> 31, 11 = x64 -> 63
+// Also used as the full-bit RX sample index (= N-1).
+function [5:0] get_clk_mult;
+    input [1:0] mode;
+    begin
+        case (mode)
+            2'b00: get_clk_mult = 6'd0;
+            2'b01: get_clk_mult = 6'd15;
+            2'b10: get_clk_mult = 6'd31;
+            2'b11: get_clk_mult = 6'd63;
+        endcase
+    end
+endfunction
+
+// WR4[7:6] clock mode -> mid-bit RX sample index (= N/2 - 1).
+//   x1 -> 0 (degenerate, sampled every tick), x16 -> 7, x32 -> 15, x64 -> 31
+function [5:0] get_start_sample;
+    input [1:0] mode;
+    begin
+        case (mode)
+            2'b00: get_start_sample = 6'd0;
+            2'b01: get_start_sample = 6'd7;
+            2'b10: get_start_sample = 6'd15;
+            2'b11: get_start_sample = 6'd31;
         endcase
     end
 endfunction
@@ -593,14 +694,14 @@ wire        parity_enable_a_s = wr4_a_s[0];
 //   11 = 2 stop bits
 wire        two_stop_bits_a_s = (wr4_a_s[3:2] == 2'b11);
 wire        x1_mode_a_s      = (wr4_a_s[7:6] == 2'b00);
-wire [3:0]  clk_mult_a_s     = x1_mode_a_s ? 4'd0 : 4'd15;
+wire [5:0]  clk_mult_a_s     = get_clk_mult(wr4_a_s[7:6]);
 
 always @(posedge sclk_a or negedge sreset_n_a) begin
     if (!sreset_n_a) begin
         tx_state_a            <= TX_IDLE;
         tx_shift_a            <= 8'hFF;
         tx_bit_cnt_a          <= 4'd0;
-        tx_sample_cnt_a       <= 4'd0;
+        tx_sample_cnt_a       <= 6'd0;
         tx_out_a              <= 1'b1;
         tx_active_a           <= 1'b0;
         tx_underrun_a         <= 1'b0;
@@ -610,7 +711,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
         tx_state_a            <= TX_IDLE;
         tx_shift_a            <= 8'hFF;
         tx_bit_cnt_a          <= 4'd0;
-        tx_sample_cnt_a       <= 4'd0;
+        tx_sample_cnt_a       <= 6'd0;
         tx_out_a              <= 1'b1;
         tx_active_a           <= 1'b0;
         tx_underrun_a         <= 1'b0;
@@ -623,8 +724,8 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                 TX_IDLE: begin
                     tx_out_a        <= 1'b1;
                     tx_active_a     <= 1'b0;
-                    tx_sample_cnt_a <= 4'd0;
-                    if (!tx_fifo_rempty_a) begin
+                    tx_sample_cnt_a <= 6'd0;
+                    if (!tx_fifo_rempty_a && tx_cts_ok_a_s) begin
                         tx_shift_a            <= tx_fifo_rdata_a;
                         tx_fifo_ren_a_s       <= 1'b1;    // pop the FIFO
                         tx_byte_grab_toggle_a <= ~tx_byte_grab_toggle_a; // notify clk
@@ -638,7 +739,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                     tx_sample_cnt_a <= tx_sample_cnt_a + 1'b1;
                     if (tx_sample_cnt_a == clk_mult_a_s) begin
                         tx_bit_cnt_a    <= 4'd0;
-                        tx_sample_cnt_a <= 4'd0;
+                        tx_sample_cnt_a <= 6'd0;
                         tx_state_a      <= TX_DATA;
                     end
                 end
@@ -649,7 +750,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                     if (tx_sample_cnt_a == clk_mult_a_s) begin
                         tx_shift_a      <= {1'b0, tx_shift_a[7:1]};
                         tx_bit_cnt_a    <= tx_bit_cnt_a + 1'b1;
-                        tx_sample_cnt_a <= 4'd0;
+                        tx_sample_cnt_a <= 6'd0;
                         if (tx_bit_cnt_a == tx_char_bits_a_s - 1)
                             tx_state_a <= parity_enable_a_s ? TX_PARITY : TX_STOP1;
                     end
@@ -660,7 +761,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                     tx_out_a        <= ^tx_shift_a ^ ~wr4_a_s[1];
                     tx_sample_cnt_a <= tx_sample_cnt_a + 1'b1;
                     if (tx_sample_cnt_a == clk_mult_a_s) begin
-                        tx_sample_cnt_a <= 4'd0;
+                        tx_sample_cnt_a <= 6'd0;
                         tx_state_a      <= TX_STOP1;
                     end
                 end
@@ -669,7 +770,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                     tx_out_a        <= 1'b1;
                     tx_sample_cnt_a <= tx_sample_cnt_a + 1'b1;
                     if (tx_sample_cnt_a == clk_mult_a_s) begin
-                        tx_sample_cnt_a <= 4'd0;
+                        tx_sample_cnt_a <= 6'd0;
                         tx_state_a      <= two_stop_bits_a_s ? TX_STOP2 : TX_IDLE;
                     end
                 end
@@ -678,7 +779,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                     tx_out_a        <= 1'b1;
                     tx_sample_cnt_a <= tx_sample_cnt_a + 1'b1;
                     if (tx_sample_cnt_a == clk_mult_a_s) begin
-                        tx_sample_cnt_a <= 4'd0;
+                        tx_sample_cnt_a <= 6'd0;
                         tx_state_a      <= TX_IDLE;
                     end
                 end
@@ -699,14 +800,14 @@ wire        parity_enable_b_s = wr4_b_s[0];
 // WR4[3:2] decode: see Channel A comment above.
 wire        two_stop_bits_b_s = (wr4_b_s[3:2] == 2'b11);
 wire        x1_mode_b_s      = (wr4_b_s[7:6] == 2'b00);
-wire [3:0]  clk_mult_b_s     = x1_mode_b_s ? 4'd0 : 4'd15;
+wire [5:0]  clk_mult_b_s     = get_clk_mult(wr4_b_s[7:6]);
 
 always @(posedge sclk_b or negedge sreset_n_b) begin
     if (!sreset_n_b) begin
         tx_state_b            <= TX_IDLE;
         tx_shift_b            <= 8'hFF;
         tx_bit_cnt_b          <= 4'd0;
-        tx_sample_cnt_b       <= 4'd0;
+        tx_sample_cnt_b       <= 6'd0;
         tx_out_b              <= 1'b1;
         tx_active_b           <= 1'b0;
         tx_underrun_b         <= 1'b0;
@@ -716,7 +817,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
         tx_state_b            <= TX_IDLE;
         tx_shift_b            <= 8'hFF;
         tx_bit_cnt_b          <= 4'd0;
-        tx_sample_cnt_b       <= 4'd0;
+        tx_sample_cnt_b       <= 6'd0;
         tx_out_b              <= 1'b1;
         tx_active_b           <= 1'b0;
         tx_underrun_b         <= 1'b0;
@@ -729,8 +830,8 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                 TX_IDLE: begin
                     tx_out_b        <= 1'b1;
                     tx_active_b     <= 1'b0;
-                    tx_sample_cnt_b <= 4'd0;
-                    if (!tx_fifo_rempty_b) begin
+                    tx_sample_cnt_b <= 6'd0;
+                    if (!tx_fifo_rempty_b && tx_cts_ok_b_s) begin
                         tx_shift_b            <= tx_fifo_rdata_b;
                         tx_fifo_ren_b_s       <= 1'b1;
                         tx_byte_grab_toggle_b <= ~tx_byte_grab_toggle_b;
@@ -744,7 +845,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                     tx_sample_cnt_b <= tx_sample_cnt_b + 1'b1;
                     if (tx_sample_cnt_b == clk_mult_b_s) begin
                         tx_bit_cnt_b    <= 4'd0;
-                        tx_sample_cnt_b <= 4'd0;
+                        tx_sample_cnt_b <= 6'd0;
                         tx_state_b      <= TX_DATA;
                     end
                 end
@@ -755,7 +856,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                     if (tx_sample_cnt_b == clk_mult_b_s) begin
                         tx_shift_b      <= {1'b0, tx_shift_b[7:1]};
                         tx_bit_cnt_b    <= tx_bit_cnt_b + 1'b1;
-                        tx_sample_cnt_b <= 4'd0;
+                        tx_sample_cnt_b <= 6'd0;
                         if (tx_bit_cnt_b == tx_char_bits_b_s - 1)
                             tx_state_b <= parity_enable_b_s ? TX_PARITY : TX_STOP1;
                     end
@@ -766,7 +867,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                     tx_out_b        <= ^tx_shift_b ^ ~wr4_b_s[1];
                     tx_sample_cnt_b <= tx_sample_cnt_b + 1'b1;
                     if (tx_sample_cnt_b == clk_mult_b_s) begin
-                        tx_sample_cnt_b <= 4'd0;
+                        tx_sample_cnt_b <= 6'd0;
                         tx_state_b      <= TX_STOP1;
                     end
                 end
@@ -775,7 +876,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                     tx_out_b        <= 1'b1;
                     tx_sample_cnt_b <= tx_sample_cnt_b + 1'b1;
                     if (tx_sample_cnt_b == clk_mult_b_s) begin
-                        tx_sample_cnt_b <= 4'd0;
+                        tx_sample_cnt_b <= 6'd0;
                         tx_state_b      <= two_stop_bits_b_s ? TX_STOP2 : TX_IDLE;
                     end
                 end
@@ -784,7 +885,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                     tx_out_b        <= 1'b1;
                     tx_sample_cnt_b <= tx_sample_cnt_b + 1'b1;
                     if (tx_sample_cnt_b == clk_mult_b_s) begin
-                        tx_sample_cnt_b <= 4'd0;
+                        tx_sample_cnt_b <= 6'd0;
                         tx_state_b      <= TX_IDLE;
                     end
                 end
@@ -794,6 +895,13 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
         end
     end
 end
+
+// Transmitter fully drained, evaluated in each channel's own sclk domain where
+// tx_state and the FIFO-empty flag are coherent. Used for the deferred /RTS
+// deassert so it never sees the brief clk-domain race between "FIFO empty" and
+// "tx_active propagated" that tx_all_sent can momentarily show at byte-grab.
+wire tx_drained_a_s = (tx_state_a == TX_IDLE) && tx_fifo_rempty_a;
+wire tx_drained_b_s = (tx_state_b == TX_IDLE) && tx_fifo_rempty_b;
 
 //============================================================================
 // Error-reset toggle CDC (clk -> sclk)
@@ -905,15 +1013,15 @@ end
 // rx_enable_a_s, loopback_a_s, rx_data_a_s declared earlier (before BREAK
 // detector) so they're visible to that block under strict parse rules.
 wire [3:0]  rx_char_bits_a_s  = get_rx_bits(wr3_a_s);
-wire [3:0]  rx_start_sample_a_s = x1_mode_a_s ? 4'd0 : 4'd7;
-wire [3:0]  rx_bit_sample_a_s   = x1_mode_a_s ? 4'd0 : 4'd15;
+wire [5:0]  rx_start_sample_a_s = get_start_sample(wr4_a_s[7:6]);
+wire [5:0]  rx_bit_sample_a_s   = get_clk_mult(wr4_a_s[7:6]);
 
 always @(posedge sclk_a or negedge sreset_n_a) begin
     if (!sreset_n_a) begin
         rx_state_a        <= RX_IDLE;
         rx_shift_a        <= 8'd0;
         rx_bit_cnt_a      <= 4'd0;
-        rx_sample_cnt_a   <= 4'd0;
+        rx_sample_cnt_a   <= 6'd0;
         rx_active_a       <= 1'b0;
         rx_overrun_a      <= 1'b0;
         rx_framing_err_a  <= 1'b0;
@@ -924,7 +1032,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
         rx_state_a        <= RX_IDLE;
         rx_shift_a        <= 8'd0;
         rx_bit_cnt_a      <= 4'd0;
-        rx_sample_cnt_a   <= 4'd0;
+        rx_sample_cnt_a   <= 6'd0;
         rx_active_a       <= 1'b0;
         rx_overrun_a      <= 1'b0;
         rx_framing_err_a  <= 1'b0;
@@ -944,11 +1052,11 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
             case (rx_state_a)
                 RX_IDLE: begin
                     rx_active_a     <= 1'b0;
-                    rx_sample_cnt_a <= 4'd0;
-                    if (rx_data_a_s == 1'b0) begin
+                    rx_sample_cnt_a <= 6'd0;
+                    if (rx_data_a_s == 1'b0 && rx_dcd_ok_a_s) begin
                         rx_state_a      <= RX_START;
                         rx_active_a     <= 1'b1;
-                        rx_sample_cnt_a <= x1_mode_a_s ? 4'd0 : 4'd1;
+                        rx_sample_cnt_a <= x1_mode_a_s ? 6'd0 : 6'd1;
                     end
                 end
 
@@ -958,7 +1066,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                         if (rx_data_a_s == 1'b0) begin
                             rx_bit_cnt_a    <= 4'd0;
                             rx_shift_a      <= 8'd0;
-                            rx_sample_cnt_a <= 4'd0;
+                            rx_sample_cnt_a <= 6'd0;
                             rx_state_a      <= RX_DATA;
                         end else begin
                             rx_state_a <= RX_IDLE;  // noise
@@ -971,7 +1079,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                     if (rx_sample_cnt_a == rx_bit_sample_a_s) begin
                         rx_shift_a      <= {rx_data_a_s, rx_shift_a[7:1]};
                         rx_bit_cnt_a    <= rx_bit_cnt_a + 1'b1;
-                        rx_sample_cnt_a <= 4'd0;
+                        rx_sample_cnt_a <= 6'd0;
                         if (rx_bit_cnt_a == rx_char_bits_a_s - 1)
                             rx_state_a <= parity_enable_a_s ? RX_PARITY : RX_STOP;
                     end
@@ -982,7 +1090,7 @@ always @(posedge sclk_a or negedge sreset_n_a) begin
                     if (rx_sample_cnt_a == rx_bit_sample_a_s) begin
                         // WR4[1]: 1 = Even parity, 0 = Odd parity (per Z8530 datasheet)
                         rx_parity_err_a <= (^rx_shift_a ^ rx_data_a_s) == wr4_a_s[1];
-                        rx_sample_cnt_a <= 4'd0;
+                        rx_sample_cnt_a <= 6'd0;
                         rx_state_a      <= RX_STOP;
                     end
                 end
@@ -1013,15 +1121,15 @@ end
 
 // rx_enable_b_s, loopback_b_s, rx_data_b_s declared earlier (see Ch A comment).
 wire [3:0]  rx_char_bits_b_s  = get_rx_bits(wr3_b_s);
-wire [3:0]  rx_start_sample_b_s = x1_mode_b_s ? 4'd0 : 4'd7;
-wire [3:0]  rx_bit_sample_b_s   = x1_mode_b_s ? 4'd0 : 4'd15;
+wire [5:0]  rx_start_sample_b_s = get_start_sample(wr4_b_s[7:6]);
+wire [5:0]  rx_bit_sample_b_s   = get_clk_mult(wr4_b_s[7:6]);
 
 always @(posedge sclk_b or negedge sreset_n_b) begin
     if (!sreset_n_b) begin
         rx_state_b        <= RX_IDLE;
         rx_shift_b        <= 8'd0;
         rx_bit_cnt_b      <= 4'd0;
-        rx_sample_cnt_b   <= 4'd0;
+        rx_sample_cnt_b   <= 6'd0;
         rx_active_b       <= 1'b0;
         rx_overrun_b      <= 1'b0;
         rx_framing_err_b  <= 1'b0;
@@ -1032,7 +1140,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
         rx_state_b        <= RX_IDLE;
         rx_shift_b        <= 8'd0;
         rx_bit_cnt_b      <= 4'd0;
-        rx_sample_cnt_b   <= 4'd0;
+        rx_sample_cnt_b   <= 6'd0;
         rx_active_b       <= 1'b0;
         rx_overrun_b      <= 1'b0;
         rx_framing_err_b  <= 1'b0;
@@ -1052,11 +1160,11 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
             case (rx_state_b)
                 RX_IDLE: begin
                     rx_active_b     <= 1'b0;
-                    rx_sample_cnt_b <= 4'd0;
-                    if (rx_data_b_s == 1'b0) begin
+                    rx_sample_cnt_b <= 6'd0;
+                    if (rx_data_b_s == 1'b0 && rx_dcd_ok_b_s) begin
                         rx_state_b      <= RX_START;
                         rx_active_b     <= 1'b1;
-                        rx_sample_cnt_b <= x1_mode_b_s ? 4'd0 : 4'd1;
+                        rx_sample_cnt_b <= x1_mode_b_s ? 6'd0 : 6'd1;
                     end
                 end
 
@@ -1066,7 +1174,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                         if (rx_data_b_s == 1'b0) begin
                             rx_bit_cnt_b    <= 4'd0;
                             rx_shift_b      <= 8'd0;
-                            rx_sample_cnt_b <= 4'd0;
+                            rx_sample_cnt_b <= 6'd0;
                             rx_state_b      <= RX_DATA;
                         end else begin
                             rx_state_b <= RX_IDLE;
@@ -1079,7 +1187,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                     if (rx_sample_cnt_b == rx_bit_sample_b_s) begin
                         rx_shift_b      <= {rx_data_b_s, rx_shift_b[7:1]};
                         rx_bit_cnt_b    <= rx_bit_cnt_b + 1'b1;
-                        rx_sample_cnt_b <= 4'd0;
+                        rx_sample_cnt_b <= 6'd0;
                         if (rx_bit_cnt_b == rx_char_bits_b_s - 1)
                             rx_state_b <= parity_enable_b_s ? RX_PARITY : RX_STOP;
                     end
@@ -1090,7 +1198,7 @@ always @(posedge sclk_b or negedge sreset_n_b) begin
                     if (rx_sample_cnt_b == rx_bit_sample_b_s) begin
                         // WR4[1]: 1 = Even parity, 0 = Odd parity (per Z8530 datasheet)
                         rx_parity_err_b <= (^rx_shift_b ^ rx_data_b_s) == wr4_b_s[1];
-                        rx_sample_cnt_b <= 4'd0;
+                        rx_sample_cnt_b <= 6'd0;
                         rx_state_b      <= RX_STOP;
                     end
                 end
@@ -1180,6 +1288,8 @@ always @(posedge clk or negedge reset_n) begin
         rx_parity_err_b_sync   <= 2'b0;
         tx_underrun_a_sync     <= 2'b0;
         tx_underrun_b_sync     <= 2'b0;
+        tx_drained_a_sync      <= 2'b11;
+        tx_drained_b_sync      <= 2'b11;
     end else begin
         tx_active_a_sync       <= {tx_active_a_sync[0],      tx_active_a};
         tx_active_b_sync       <= {tx_active_b_sync[0],      tx_active_b};
@@ -1195,6 +1305,8 @@ always @(posedge clk or negedge reset_n) begin
         rx_parity_err_b_sync   <= {rx_parity_err_b_sync[0],  rx_parity_err_b};
         tx_underrun_a_sync     <= {tx_underrun_a_sync[0],    tx_underrun_a};
         tx_underrun_b_sync     <= {tx_underrun_b_sync[0],    tx_underrun_b};
+        tx_drained_a_sync      <= {tx_drained_a_sync[0],     tx_drained_a_s};
+        tx_drained_b_sync      <= {tx_drained_b_sync[0],     tx_drained_b_s};
     end
 end
 
@@ -1210,6 +1322,8 @@ wire rx_parity_err_a_c  = rx_parity_err_a_sync[1];
 wire rx_parity_err_b_c  = rx_parity_err_b_sync[1];
 wire tx_underrun_a_c    = tx_underrun_a_sync[1];
 wire tx_underrun_b_c    = tx_underrun_b_sync[1];
+wire tx_drained_a_c     = tx_drained_a_sync[1];
+wire tx_drained_b_c     = tx_drained_b_sync[1];
 
 // TX-int trigger: rising/falling edge of the toggle indicates the FSM
 // just grabbed a byte from the FIFO.
@@ -1227,6 +1341,30 @@ wire tx_all_sent_a   = tx_fifo_wempty_a & ~tx_active_a_c;
 wire tx_all_sent_b   = tx_fifo_wempty_b & ~tx_active_b_c;
 
 //============================================================================
+// Auto-Enable deferred /RTS deassert (clk):
+//   - assert (rts_hold=1) immediately when WR5[1] set
+//   - WR5[1] cleared, Auto Enables off  -> release immediately (follow bit)
+//   - WR5[1] cleared, Auto Enables on   -> hold until transmitter empty
+//============================================================================
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        rts_hold_a <= 1'b0;
+        rts_hold_b <= 1'b0;
+    end else begin
+        // Channel A
+        if (rst_a_clk)                                   rts_hold_a <= 1'b0;
+        else if (wr5_a[1])                               rts_hold_a <= 1'b1;
+        else if (!((AUTO_ENABLES_EN != 0) && wr3_a[5]))  rts_hold_a <= 1'b0;
+        else if (tx_drained_a_c)                         rts_hold_a <= 1'b0;
+        // Channel B
+        if (rst_b_clk)                                   rts_hold_b <= 1'b0;
+        else if (wr5_b[1])                               rts_hold_b <= 1'b1;
+        else if (!((AUTO_ENABLES_EN != 0) && wr3_b[5]))  rts_hold_b <= 1'b0;
+        else if (tx_drained_b_c)                         rts_hold_b <= 1'b0;
+    end
+end
+
+//============================================================================
 // Read Registers (RR0/RR1/RR2/RR3/RR8/RR10/RR12/RR13/RR15)
 //============================================================================
 
@@ -1235,7 +1373,7 @@ assign rr0_a = {
     break_a_c,             // Break/Abort
     tx_underrun_a_c,       // TX Underrun/EOM
     ~ctsa_sync[2],         // CTS
-    ~synca_sync[2],        // Sync/Hunt (= /SYNCA pin, wired to DSR on Lisa)
+    ~synca_sync[2],        // Sync/Hunt (async: follows /SYNCA pin)
     ~dcda_sync[2],         // DCD
     tx_room_clk_a,         // TX Buffer Empty (= room available)
     1'b0,                  // Zero Count
@@ -1246,7 +1384,7 @@ assign rr0_b = {
     break_b_c,
     tx_underrun_b_c,
     ~ctsb_sync[2],
-    ~syncb_sync[2],        // Sync/Hunt (= /SYNCB pin; XTAL on Lisa, kept for symmetry)
+    ~syncb_sync[2],        // Sync/Hunt (async: follows /SYNCB pin)
     ~dcdb_sync[2],
     tx_room_clk_b,
     1'b0,
