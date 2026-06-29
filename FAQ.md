@@ -12,6 +12,9 @@ The 100% compatibility falls apart a bit when you start overclocking your LisaFP
 ## My board doesn't do anything when I hit the Lisa power button (no power LED or anything). What's going on?
 The FPGA probably didn't get programmed at power-on. I've seen this happen very, very occasionally on my boards, but it's so infrequent that I can't reproduce it enough to figure out what's wrong or devise a fix. The solution is simple: just power-cycle the board or hit the PROGRAM button and wait for the DONE LED to light up.
 
+## How much power does the LisaFPGA desktop board consume? Can I power it off a USB power bank?
+When in the standard configuration that most people will be using (max overclock, USB keyboard/mouse, Floppy Emu), the board uses about 2.8W of power, which will give you between 14 and 18 hours of battery life if you power it from a standard 10,000mAh USB power bank. Not sure why you would want to do this, but I think it's pretty cool, so I figured I'd mention it!
+
 ## The power LED comes on when I hit the Lisa's power button, but I don't get any video output over HDMI. Perhaps the monitor even says that the input format is unsupported. What's going on?
 Some cheaper monitors (and especially cheap capture devices) can be kind of picky about the framerate that the board outputs and will only display either 30FPS or 60FPS, but not both. Try moving the HDMI FRAMERATE jumper from whatever position it's currently in to the other position and see if that fixes things. If both positions work, then put the jumper in the 60FPS position for a better experience.
 
