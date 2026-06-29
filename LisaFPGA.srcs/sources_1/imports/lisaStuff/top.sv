@@ -14,7 +14,7 @@
 // Dependencies: 
 // 
 // Revision:
-// Revision 0.01 - File Created
+// Revision 1.2 - Fixed SRAM issues for boards with marginal SRAM ICs and started clocking the VIAs off DOTCK instead of E for better timing stability.
 // Additional Comments:
 // 
 //////////////////////////////////////////////////////////////////////////////////
